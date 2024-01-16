@@ -1,0 +1,2097 @@
+---
+title: "Usher Syndrome miRNA Microarray Analysis"
+author: "Wesley A. Tom"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/Users/westom/Desktop/Usher_miRNA_github/")
+```
+
+## Some Useful Packages
+
+
+```{r, echo=TRUE, warning=F, message=F}
+#If you haven't installed them here you go:
+#install.packages("NACHO")
+#install.packages('nanostringr')
+library(BiocManager)
+#BiocManager::install("GEOquery")
+#BiocManager::install("limma")
+#load them up:
+library(NACHO)
+library(nanostringr)
+library(ggsci)
+library(ggplot2)
+library(gridExtra)
+library(limma)
+library(data.table)
+library(png)
+library(dplyr)
+library(phyloseq)
+library(DESeq2)
+library(ComplexHeatmap)
+pal1 <- pal_simpsons("springfield")(16) #makes a color palette for the figures
+
+```
+
+
+## Data Import and Normalization
+
+Here we read in the .RCC count files for all of the miRNA microarray assays in the lab currently. We will subset this later to just Usher and NBT cell lines. Here we use the NACHO package to normalize the data. The top houskeeping miRNAs are predicted by NACHO (housekeeping_predict = T) using the function:
+```
+find_housekeeping <- function(data, id_colname, count_column) {
+  CodeClass <- NULL # no visible binding for global variable
+  data <- data[grep("Endogenous|Housekeeping", CodeClass)]
+  ratios <- lapply(
+    X = split(data, data[[id_colname]]),
+    count_column = count_column,
+    FUN = function(.data, count_column) {
+      .data <- .data[j = .SD, .SDcols = c("Name", count_column)]
+      sample_means <- mean(.data[[count_column]])
+      ratios <- log2(.data[[count_column]] / sample_means)
+      names(ratios) <- .data[["Name"]]
+      ratios[is.infinite(ratios)] <- NA_real_
+      ratios
+    }
+  )
+  ratios <- do.call("cbind", ratios)
+  ratiosd <- apply(X = ratios, MARGIN = 1, FUN = stats::sd, na.rm = TRUE)
+  ratiosd <- sort(ratiosd, decreasing = FALSE)
+  names(ratiosd)[1:5]
+}
+```
+
+and the count data are normalized by their respective geometric mean (normalisation_method = "GEO") using the following:
+```
+geometric_mean <- function(x) {
+  x[x == 0] <- 1
+  exp(mean(log(x)))
+}
+```
+
+"The normalisation methods GEOor GLM are used to compute the normalisation factors for positive and housekeeping probes.
+They also used to compute the "negative factor" (poor naming choice though): "geometric mean" (GEO) or the corresponding value from GLM of negative probes.
+
+To summarise NACHO computes a data.frame with three columns:
+
+"Positive_factor"
+"Negative_factor"
+"House_factor" (not necessarily used)
+The simple formula for the normalisation is:
+(Count_i - geo(Negative_i)) * PositiveF (with PositiveF: mean(geo(Positive)) / geo(Positive_i))
+or
+(Count - Negative) * PositiveF * HousekeepingF
+In addition negative counts are replaced with 0.
+
+For short, background is taken into account.
+Although, you can add additional threshold to be more "biologically relevant".
+
+If you are interested in details:
+
+R/norm_geo.R
+R/norm_glm.R
+geometric_housekeeping.R
+factor_calculation.R
+normalise_counts.R"
+
+```{r}
+ush_mirna_nacho <-load_rcc(data_directory = "rcc_files/",
+         ssheet_csv = "samplesheet.csv",
+         id_colname = "IDFILE",
+         housekeeping_predict = T)
+
+ush_norm <- normalise(
+  nacho_object = ush_mirna_nacho,#the imported data
+  #housekeeping_genes = housekeeping, #can provide a list of housekeeping genes if preferred
+  housekeeping_predict = T, #predict good housekeeping candidates
+  housekeeping_norm = TRUE, #normalize relative to predicted housekeeping genes
+  normalisation_method = "GEO", #geometric mean calculation
+  remove_outliers = F #you can specify whether to keep or get rid of outliers that did not make the QC cutoff for one reason or another...
+)
+
+#visualise(ush_norm)
+#render(ush_norm)
+
+```
+
+Extract the data that we want to look at, in this case the sample data and the count data:
+
+```{r}
+
+#Select phenotype data that you want, in our case this takes the columns from our sample data (SD)
+#that match what we want to look at, and makes a data.table object of them calls selected_pheno:
+selected_pheno <- ush_norm[["nacho"]][
+  j = lapply(unique(.SD), function(x) ifelse(x == "NA", NA, x)),
+  .SDcols = c("IDFILE", "sampleID", "cartridgeID", "phenotype","genotype","source","USHvsCONT","Immortal_vs_fresh","carrier_vs_nbt","cell_source","cell_status","origin","study")
+]
+selected_pheno <- na.exclude(selected_pheno) #remove any data from the data table that has n/a or empty information
+
+#get normalised cout data from our "nacho" object
+expr_counts <- ush_norm[["nacho"]][
+  i = grepl("Endogenous", CodeClass),
+  j = as.matrix(
+    dcast(.SD, Name ~ IDFILE, value.var = "Count_Norm"),
+    "Name"
+  ),
+  .SDcols = c("IDFILE", "Name", "Count_Norm")
+]
+
+samplekept <- intersect(selected_pheno[["IDFILE"]], colnames(expr_counts))
+expr_counts <- expr_counts[,samplekept]
+selected_pheno <- selected_pheno[IDFILE %in% c(samplekept)]
+
+#write.table(expr_counts, file = "all_miRNA_array.norm.epr.cts.tsv", sep="\t")
+```
+
+Now is the point where we will subset the dataset into the samples of interest, which are the Usher phenotypes and our NBT control phenotypes transformed with EBV.
+
+```{r}
+#subset dataset to match comparisons desired....
+#we need last 2 runs Usher samples plus controls -NBTi from newest run...
+#could reach out to Jennifer at UNMC and see how she goes about combining runs...
+
+ush_vs_cont_pheno <- selected_pheno[selected_pheno$USHvsCONT %in% c("yes"),]
+ush_vs_cont_samplekept <- intersect(ush_vs_cont_pheno[["IDFILE"]], colnames(expr_counts))
+ush_vs_cont_expr_counts <- expr_counts[,ush_vs_cont_samplekept]
+rownames(ush_vs_cont_pheno) <- ush_vs_cont_pheno$sampleID
+colnames(ush_vs_cont_expr_counts) <- ush_vs_cont_pheno$sampleID
+
+
+#make some phyloseq objects
+
+uvc_tax <- data.frame(ush_vs_cont_expr_counts)
+uvc_tax$Kingdom <- paste0(rownames(uvc_tax))
+uvc_tax$Phylum <- paste0(rownames(uvc_tax))
+uvc_tax$Class <- paste0(rownames(uvc_tax))
+uvc_tax$Order <-paste0(rownames(uvc_tax))
+uvc_tax$Family <- paste0(rownames(uvc_tax))
+uvc_tax$Genus <- paste0(rownames(uvc_tax))
+uvc_tax$Species <- paste0(rownames(uvc_tax))
+uvc_tax2 <- uvc_tax[,c(18:24)]
+uvc_tax2 <- tax_table(as(uvc_tax2,"matrix"))
+
+
+uvc.otu <- otu_table(ush_vs_cont_expr_counts,taxa_are_rows = T)
+
+uvc.samdat<- sample_data(ush_vs_cont_pheno[,c(2,1,3:13)])
+rownames(uvc.samdat) <- uvc.samdat$sampleID
+
+uvc.ps <- phyloseq(uvc.otu,uvc.samdat,uvc_tax2)
+uvc.ps
+
+
+```
+
+
+
+## PERMANOVA Analysis
+
+This test will tell us if our phenotype miRNA profiles are significantly different from one another, here we use the variable sample type.
+
+```{r message=FALSE, warning=FALSE, echo = TRUE}
+library(vegan)
+set.seed(1234)
+metadat <- data.frame(sample_data(uvc.ps))
+
+permanova <- adonis2(phyloseq::distance(uvc.ps, method="bray") ~ phenotype + source, data= metadat, permutation=999)
+permanova
+
+permanova$Model <- row.names(permanova)
+permanova <-permanova[,c(6,1:5)]
+
+
+```
+
+```{r message=FALSE, warning=FALSE, echo = TRUE}
+library(microViz)
+library(ggrepel)
+library(gridExtra)
+# first we make a function that replaces any unwanted "_" in our taxa labels with spaces
+library(stringr) 
+renamer <- function(x) str_replace(x, pattern = "hsa-miR-", replacement = "")
+
+pca <- uvc.ps %>% microViz::ord_calc(method = "PCA")
+pca_ord <- ord_plot(data = pca,
+                           color = "phenotype",
+                           shape = "phenotype",
+                           plot_taxa = 1:8,
+                           taxon_renamer = renamer,
+                           tax_vec_length = 1.5, # this value is a scalar multiplier for the biplot score vectors
+    tax_lab_style = tax_lab_style(size = 2, 
+                                  alpha = 0.8, 
+                                  type = "text", 
+                                  max_angle = 90,
+                                  check_overlap = T), # create a list of options to tweak the taxa labels' default style
+    constraint_vec_style = vec_constraint(size = 0.5, alpha = 0.75), # this styles the constraint arrows
+    constraint_lab_style = constraint_lab_style(size = 1, justify = "auto"),
+    size = 4) + # this styles the constrain
+  scale_color_manual(values = pal1) +
+  coord_fixed(ratio = 1, clip = "off", xlim = c(-400,500),ylim = c(-200,450))+
+  scale_shape_manual(name = "Cell Line Sample Type",
+                       #breaks = c("NBT_A","USHtype1","USHtype2","USHtype3"),
+                       labels = c("Control","USH1", "USH2","USH3"),
+                       values = c(19,17,17,17)) +
+  scale_color_manual(name = "Cell Line Sample Type",
+                       #breaks = c("NBT_A","USHtype1","USHtype2","USHtype3"),
+                       labels = c("Control","USH1", "USH2","USH3"),
+                       values = c("#FED439FF", "#709AE1FF", "#8A9197FF", "#91331FFF")) + 
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.border = element_rect(colour ="gray", fill = NA, size = .5),
+        plot.background = element_rect(colour = "gray", fill = NA, size = 2))
+pca_ord
+
+
+tt1 <- ttheme_minimal(core=list(bg_params = list(fill = "white",col=NA),
+                                fg_params=list(fontface=3, fontsize=6)),
+                      colhead=list(fg_params=list(fontface=4L, fontsize = 6),
+                                   bg_params = list(fill = "white")))
+perm <- tableGrob(permanova, rows=NULL, theme = tt1)
+library(gtable)
+library(grid)
+perm <- gtable_add_grob(perm,
+        grobs = rectGrob(gp = gpar(fill = NA, lwd = 2)),
+        t = 2, b = nrow(perm), l = 1, r = ncol(perm))
+perm <- gtable_add_grob(perm,
+        grobs = rectGrob(gp = gpar(fill = NA, lwd = 2)),
+        t = 1, l = 1, r = ncol(perm))
+pca_ord_perm <- pca_ord + annotation_custom(perm, 
+                    xmin=-450, xmax=100, ymin=250, ymax=500)
+pca_ord_perm
+#ggsave(filename = "PCA_permanova_usher_miRNA.pdf",pca_ord_perm,device = "pdf", width = 8, height = 5.5)
+
+
+```
+
+## DESeq2 diff miRNAs by phenotype:
+
+```{r}
+
+library("DESeq2")#;packageVersion('DESeq2')
+
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+dds <- phyloseq_to_deseq2(uvc.ps, ~phenotype)
+
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq2::DESeq(dds, test = "Wald", fitType = "local")
+resultsNames(dds)
+#########################################################################################################################
+ush1.nbt.res = results(dds, contrast =c("phenotype","USHtype1","NBT_A") )
+ush1.nbt.res = ush1.nbt.res[order(ush1.nbt.res$padj, na.last=NA), ]
+alpha = 0.05
+
+ush1.nbt.sigtab = ush1.nbt.res[(ush1.nbt.res$padj < alpha), ]
+ush1.nbt.sigtab = cbind(as(ush1.nbt.sigtab, "data.frame"), as(tax_table(uvc.ps)[rownames(ush1.nbt.sigtab), ], "matrix"))
+
+#order df by log fold change and manually inspect where 2fold change threshold is, in this case row 76:
+o = order(abs(ush1.nbt.sigtab$log2FoldChange), decreasing = TRUE)
+ush1.nbt.sigtab2 = ush1.nbt.sigtab[o, ]
+ush1.nbt.sigtab2 = ush1.nbt.sigtab2[1:63,]
+ush1.nbt.sigtab2
+#########################################################################################################################
+ush2.nbt.res = results(dds, contrast =c("phenotype","USHtype2","NBT_A") )
+ush2.nbt.res = ush2.nbt.res[order(ush2.nbt.res$padj, na.last=NA), ]
+ush2.nbt.sigtab = ush2.nbt.res[(ush2.nbt.res$padj < alpha), ]
+ush2.nbt.sigtab = cbind(as(ush2.nbt.sigtab, "data.frame"), as(tax_table(uvc.ps)[rownames(ush2.nbt.sigtab), ], "matrix"))
+
+#order df by log fold change and manually inspect where 2fold change threshold is, in this case row 76:
+o = order(abs(ush2.nbt.sigtab$log2FoldChange), decreasing = TRUE)
+ush2.nbt.sigtab2 = ush2.nbt.sigtab[o, ]
+ush2.nbt.sigtab2 = ush2.nbt.sigtab2[1:62,]
+ush2.nbt.sigtab2
+########################################################################################################################
+
+ush3.nbt.res = results(dds, contrast =c("phenotype","USHtype3","NBT_A") )
+ush3.nbt.res = ush3.nbt.res[order(ush3.nbt.res$padj, na.last=NA), ]
+ush3.nbt.sigtab = ush3.nbt.res[(ush3.nbt.res$padj < alpha), ]
+ush3.nbt.sigtab = cbind(as(ush3.nbt.sigtab, "data.frame"), as(tax_table(uvc.ps)[rownames(ush3.nbt.sigtab), ], "matrix"))
+
+#order df by log fold change and manually inspect where 2fold change threshold is, in this case row 76:
+o = order(abs(ush3.nbt.sigtab$log2FoldChange), decreasing = TRUE)
+ush3.nbt.sigtab2 = ush3.nbt.sigtab[o, ]
+ush3.nbt.sigtab2 = ush3.nbt.sigtab2[1:56,]
+ush3.nbt.sigtab2
+########################################################################################################################
+
+
+ush1.ush2.common_miRNAs <- merge(ush1.nbt.sigtab2, ush2.nbt.sigtab2, by = "row.names", all = T)
+
+ush1.ush3.common_miRNAs <- merge(ush1.nbt.sigtab2,ush3.nbt.sigtab2, by = "row.names", all = T)
+
+ush2.ush3.common_miRNAs <- merge(ush2.nbt.sigtab2,ush3.nbt.sigtab2, by = "row.names", all = T)
+
+row.names(ush1.ush2.common_miRNAs) <- ush1.ush2.common_miRNAs$Row.names
+ush1.ush2.ush3.common_miRNAs<- merge(ush1.ush2.common_miRNAs, ush3.nbt.sigtab2, by = "row.names", all = TRUE)
+```
+
+## DESeq2 diff miRNAs by sample type source:
+
+```{r}
+
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+dds <- phyloseq_to_deseq2(uvc.ps, ~source)
+
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds = estimateSizeFactors(dds,geoMeans=geoMeans)
+
+dds = DESeq2::DESeq(dds, test = "Wald", fitType = "local")
+resultsNames(dds)
+#########################################################################################################################
+pat.ctrl.res = results(dds, contrast =c("source","patient","control") )
+pat.ctrl.res = pat.ctrl.res[order(pat.ctrl.res$padj, na.last=NA), ]
+alpha = 0.05
+
+pat.ctrl.sigtab = pat.ctrl.res[(pat.ctrl.res$padj < alpha), ]
+pat.ctrl.sigtab = cbind(as(pat.ctrl.sigtab, "data.frame"), as(tax_table(uvc.ps)[rownames(pat.ctrl.sigtab), ], "matrix"))
+
+#order df by log fold change and manually inspect where 2fold change threshold is, in this case row 76:
+o = order(abs(pat.ctrl.sigtab$log2FoldChange), decreasing = TRUE)
+pat.ctrl.sigtab2 = pat.ctrl.sigtab[o, ]
+pat.ctrl.sigtab2 = pat.ctrl.sigtab2[1:56,]
+pat.ctrl.sigtab2
+```
+
+Lets spend some time figuring out which DE miRNAs are unique to each phenotype. We did this in a couple ways, one is to create the Venn Diagram which shows how many DE miRNAs are unique to each group and subgroup. Then we extract the unique values all the venn clssifications and make a table of the information.
+
+
+```{r}
+########################################################################################################################
+ush1 <- row.names(ush1.nbt.sigtab2)
+ush2 <- row.names(ush2.nbt.sigtab2)
+ush3 <- row.names(ush3.nbt.sigtab2)
+########################################################################################################################
+pat.ctrl<- row.names(pat.ctrl.sigtab2)
+
+########################################################################################################################
+library(ggvenn)
+ushlist <- list('Usher 1' = ush1, 'Usher 2' = ush2, 'Usher 3' = ush3)
+
+ushvenn <- ggvenn(ushlist) + scale_fill_manual(values =c("#8A9197FF","#709AE1FF","#FED439FF"))
+
+ushvenn
+
+
+ # ggsave("ushvenn.pdf", ushvenn, width = 10, height = 10)
+
+
+########################################################################################################################
+########################################################################################################################
+
+```
+```{r}
+set.seed(1)
+Intersect <- function (x) {  
+  # Multiple set version of intersect
+  # x is a list
+  if (length(x) == 1) {
+    unlist(x)
+  } else if (length(x) == 2) {
+    intersect(x[[1]], x[[2]])
+  } else if (length(x) > 2){
+    intersect(x[[1]], Intersect(x[-1]))
+  }
+}
+
+Union <- function (x) {  
+  # Multiple set version of union
+  # x is a list
+  if (length(x) == 1) {
+    unlist(x)
+  } else if (length(x) == 2) {
+    union(x[[1]], x[[2]])
+  } else if (length(x) > 2) {
+    union(x[[1]], Union(x[-1]))
+  }
+}
+
+Setdiff <- function (x, y) {
+  # Remove the union of the y's from the common x's. 
+  # x and y are lists of characters.
+  xx <- Intersect(x)
+  yy <- Union(y)
+  setdiff(xx, yy)
+}
+########################################################################################################################
+ushlist <- list(A = ush1,
+                B= ush2,
+                C= ush3)
+shared_ush_differentials <- Intersect(ushlist)
+
+ush1_unique <- Setdiff(ushlist[c("A")], ushlist[c("B","C")])
+
+ush2_unique <- Setdiff(ushlist[c("B")], ushlist[c("A","C")])
+
+ush3_unique <- Setdiff(ushlist[c("C")], ushlist[c("A","B")])
+
+ush12_unique <- Setdiff(ushlist[c("A","B")], ushlist[c("C")])
+
+ush13_unique <- Setdiff(ushlist[c("A","C")], ushlist[c("B")])
+
+ush23_unique <- Setdiff(ushlist[c("B","C")], ushlist[c("A")])
+full_derepped_list <- Union(ushlist)
+
+namelist <-c("Common To All","Usher 1 Only","Usher 2 Only", "Usher 3 Only", "Usher 1 and 2", "Usher 1 and 3", "Usher 2 and 3")
+miRNAs <- list(shared_ush_differentials,
+               ush1_unique,
+               ush2_unique,
+               ush3_unique,
+               ush12_unique,
+               ush13_unique,
+               ush23_unique)
+df <- data.frame(Category = namelist,
+                  Total = c(36,20,14,5,2,5,10),
+                 miRNAs = c("hsa-miR-222-3p,hsa-miR-424-5p,hsa-miR-503-5p,
+hsa-miR-1252-5p,hsa-miR-1246,hsa-miR-182-5p,
+hsa-miR-1205,hsa-miR-450a-5p,hsa-miR-654-5p,
+hsa-miR-3934-5p,hsa-miR-221-5p,hsa-miR-34a-5p,
+hsa-miR-150-5p,hsa-let-7d-5p,hsa-miR-483-3p,
+hsa-miR-146b-5p,hsa-miR-5010-3p,hsa-miR-591,
+hsa-miR-155-5p,hsa-miR-363-3p,hsa-let-7i-5p,
+hsa-miR-194-5p,hsa-miR-28-3p,hsa-miR-10a-5p,
+hsa-miR-146a-5p,hsa-miR-337-3p,hsa-miR-200c-3p,
+hsa-miR-96-5p,hsa-miR-5196-3p+hsa-miR-6732-3p,hsa-let-7f-5p,
+hsa-miR-577,hsa-let-7g-5p,hsa-miR-183-5p,
+hsa-let-7b-5p,hsa-miR-148a-3p,hsa-miR-98-5p",
+"hsa-miR-151a-5p,hsa-miR-129-2-3p,hsa-miR-519d-3p,hsa-miR-4431,hsa-miR-345-5p,hsa-miR-152-3p,
+hsa-miR-1260b,hsa-miR-3916,hsa-miR-4455,hsa-miR-3195,hsa-miR-195-5p,hsa-miR-1226-3p,
+hsa-miR-151a-3p,hsa-miR-181b-2-3p,hsa-miR-1287-5p,hsa-miR-324-5p,hsa-miR-484,hsa-miR-16-5p,
+hsa-miR-331-3p,hsa-miR-26b-5p",
+"hsa-miR-513b-5p,hsa-miR-137,hsa-miR-370-3p,hsa-miR-503-3p,hsa-miR-767-5p,hsa-miR-132-3p,hsa-let-7c-5p,
+hsa-miR-1304-5p,hsa-miR-514a-3p,hsa-let-7a-5p,hsa-miR-342-3p,hsa-miR-181a-5p,hsa-miR-181c-5p,hsa-miR-1193
+",
+"hsa-miR-125a-3p,hsa-miR-494-3p,hsa-miR-125b-5p,hsa-miR-4284,hsa-miR-181a-2-3p",
+"hsa-miR-551b-3p,hsa-miR-299-3p",
+"hsa-miR-371b-5p,hsa-miR-601,hsa-miR-1827,hsa-miR-27a-3p,hsa-miR-582-5p",
+"hsa-miR-574-3p,hsa-miR-223-3p,hsa-miR-1183,hsa-miR-28-5p,hsa-miR-542-5p,hsa-let-7e-5p,hsa-miR-23c,
+hsa-miR-221-3p,hsa-miR-374b-5p,hsa-miR-23a-3p"))
+
+#write.table(df, file = "ush1.ush2.ush3.common_miRNAs.txt", sep = "\t")
+
+
+
+
+library(kableExtra)
+tab<- kbl(df, format = "html", booktabs = T) %>%
+  kable_styling(full_width = F, latex_options = c("scale_down")) %>%
+  row_spec(0, bold = T) %>%
+  column_spec(3, width = "30em")
+  #column_spec(1, bold = T, underline = T) %>%
+  #column_spec(2, bold = T)
+#save_kable(tab, file = "~/Desktop/Usher_miRNA/all_de_mirna_tab.pdf")
+tab
+
+
+
+```
+
+## Heatmap summarizing DE miRNAs
+```{r}
+library(ComplexHeatmap)
+library(genefilter)
+library(circlize)
+library(dendextend)
+library(dendsort)
+col_fun = colorRamp2(c(-2, 0, 2), c("#D62728FF", "white", "#2CA02CFF"))
+mat <- scale(t(ush_vs_cont_expr_counts)) #scale normalizes count data: z = (x — u) / s; x=count u=col_mean s=stddev
+mat_trim <- mat[,colnames(mat) %in% full_derepped_list]
+
+mat_trim_common <- mat[,colnames(mat) %in% shared_ush_differentials]
+
+mat_trim_ush1 <- mat[,colnames(mat) %in% ush1_unique]
+
+mat_trim_ush2 <- mat[,colnames(mat) %in% ush2_unique]
+
+mat_trim_ush3 <- mat[,colnames(mat) %in% ush3_unique]
+
+mat_trim_ush12 <- mat[,colnames(mat) %in% ush12_unique]
+
+mat_trim_ush13 <- mat[,colnames(mat) %in% ush13_unique]
+
+mat_trim_ush23 <- mat[,colnames(mat) %in% ush23_unique]
+#Heatmap(scale(t(miRNA_final_count_tab)))#this is the same as below...
+
+row_dend = as.dendrogram(hclust(dist(mat_trim)))
+#row_dend = color_branches(row_dend, k = 5,col=c("#8A9197FF","#709AE1FF","#C80813FF","#46732EFF","orange"))
+col_dend = dendsort(hclust(dist(t(mat_trim))))
+#pdf(file = "final_htmap.pdf", width = 12, height = 8, fonts = "Times")
+fhp <- Heatmap(mat_trim, name = "Scale", 
+        cluster_rows = row_dend, 
+        row_split = 2,
+        row_title = c("Control","Usher"),
+        row_dend_reorder = TRUE,
+        row_title_rot = 0,
+        column_km = 6,
+        column_title = LETTERS[1:6],
+        col= col_fun, 
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize=8))
+#dev.off()
+ 
+
+fhp
+#common heatmap
+common_heatmap <- Heatmap(mat_trim_common, name = "Scale", 
+        cluster_rows = row_dend, 
+        row_split = 2,
+        row_title = c("Control","Usher"),
+        row_dend_reorder = TRUE,
+        row_title_rot = 0,
+        column_km = 6,
+        column_title = LETTERS[1:6],
+        col= col_fun, 
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize=8))
+#pdf(file = "common_htmap.pdf", width = 12, height = 8, fonts = "Times")
+common_heatmap
+#dev.off()
+
+#ush1_only_htmp
+ush1_heatmap <- Heatmap(mat_trim_ush1, name = "Scale", 
+        cluster_rows = row_dend, 
+        row_split = 2,
+        row_title = c("Control","Usher"),
+        row_dend_reorder = TRUE,
+        row_title_rot = 0,
+        column_km = 6,
+        column_title = LETTERS[1:6],
+        col= col_fun, 
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize=8))
+#pdf(file = "ush1_htmap.pdf", width = 12, height = 8, fonts = "Times")
+ush1_heatmap
+#dev.off()
+
+#ush2_only_htmp
+ush2_heatmap <- Heatmap(mat_trim_ush2, name = "Scale", 
+        cluster_rows = row_dend, 
+        row_split = 2,
+        row_title = c("Control","Usher"),
+        row_dend_reorder = TRUE,
+        row_title_rot = 0,
+        column_km = 6,
+        column_title = LETTERS[1:6],
+        col= col_fun, 
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize=8))
+#pdf(file = "ush2_htmap.pdf", width = 12, height = 8, fonts = "Times")
+ush2_heatmap
+#dev.off()
+
+#ush 3 heatmap only has one miRNA
+#ush3_heatmap <- Heatmap(mat_trim_ush3, name = "Scale", 
+        #cluster_rows = row_dend, 
+        #row_split = 2,
+        #row_title = c("Control","Usher"),
+        #row_dend_reorder = TRUE,
+        #row_title_rot = 0,
+        #column_km = 2,
+        #column_title = LETTERS[1:2],
+        #col= col_fun, 
+        #column_namerot = 45,
+        #column_namegp = gpar(fontsize=8))
+#pdf(file = "ush3_htmap.pdf", width = 12, height = 8, fonts = "Times")
+#ush3_heatmap
+#dev.off()
+
+#usher1 and 2 only
+#ush12_heatmap <- Heatmap(mat_trim_ush12, name = "Scale", 
+ #       cluster_rows = row_dend, 
+  #      row_split = 2,
+   #    row_dend_reorder = TRUE,
+    #    row_title_rot = 0,
+    #    column_km = 2,
+     #   column_title = LETTERS[1:2],
+      #  col= col_fun, 
+       # column_namerot = 45,
+        #column_namegp = gpar(fontsize=8))
+#pdf(file = "ush12_htmap.pdf", width = 12, height = 8, fonts = "Times")
+#ush12_heatmap
+#dev.off()
+
+#usher 1 and 3
+
+#ush13_heatmap <- Heatmap(mat_trim_ush13, name = "Scale", 
+ #       cluster_rows = row_dend, 
+  #      row_split = 2,
+   #     row_title = c("Control","Usher"),
+    #    row_dend_reorder = TRUE,
+     #   row_title_rot = 0,
+      #  column_km = 2,
+       # column_title = LETTERS[1:2],
+        #col= col_fun, 
+        #column_namerot = 45,
+        #column_namegp = gpar(fontsize=8))
+#pdf(file = "ush13_htmap.pdf", width = 12, height = 8, fonts = "Times")
+#ush13_heatmap
+#dev.off()
+
+
+#Usher 2 and 3
+
+#ush23_heatmap <- Heatmap(mat_trim_ush23, name = "Scale", 
+ #       cluster_rows = row_dend, 
+  #      row_split = 2,
+   #     row_title = c("Control","Usher"),
+    #    row_dend_reorder = TRUE,
+     #   row_title_rot = 0,
+      #  column_km = 6,
+       # column_title = LETTERS[1:6],
+        #col= col_fun, 
+        #column_namerot = 45,
+        #column_namegp = gpar(fontsize=8))
+#pdf(file = "ush23_htmap.pdf", width = 12, height = 8, fonts = "Times")
+#ush23_heatmap
+#dev.off()
+
+#the top 22 PCA and DESeq consistent
+
+top.miRNAS<- c("hsa-miR-146a-5p","hsa-miR-155-5p","hsa-miR-16-5p","hsa-miR-29b-3p",
+"hsa-miR-19b-3p",
+"hsa-miR-4454+hsa-miR-7975",
+"hsa-miR-142-3p",
+"hsa-miR-96-5p",
+"hsa-miR-182-5p",
+"hsa-miR-183-5p",
+"hsa-miR-181b-2-3p",
+"hsa-miR-519d-3p",
+"hsa-miR-566",
+"hsa-miR-4431",
+"hsa-miR-484",
+"hsa-miR-331-3p",
+"hsa-miR-296-5p",
+"hsa-miR-15a-5p",
+"hsa-miR-129-2-3p",
+"hsa-miR-337-3p",
+"hsa-miR-223-3p",
+"hsa-miR-21-5p")
+
+
+
+
+
+```
+make some tables of the differential miRNAs
+
+```{r eval=FALSE}
+
+
+#common_sigtab <- 
+
+ush1_only_sigtab <- ush1.nbt.sigtab2[row.names(ush1.nbt.sigtab2) %in% ush1_unique,]
+ush1_only_sigtab <- ush1_only_sigtab[,1:6]
+
+ush2_only_sigtab <- ush2.nbt.sigtab2[row.names(ush2.nbt.sigtab2) %in% ush2_unique,]
+ush2_only_sigtab <- ush2_only_sigtab[,1:6]
+
+ush3_only_sigtab <- ush3.nbt.sigtab2[row.names(ush3.nbt.sigtab2) %in% ush3_unique,]
+ush3_only_sigtab <- ush3_only_sigtab[,1:6]
+
+#pat.ctrl_only_sigtab <- pat.ctrl.sigtab2[row.names(pat.ctrl.sigtab2) %in% pat.ctrl_unique,]
+#pat.ctrl_only_sigtab <- pat.ctrl_only_sigtab[,1:6]
+
+#car.ctrl_only_sigtab <- car.ctrl.sigtab2[row.names(car.ctrl.sigtab2) %in% car.ctrl_unique,]
+#car.ctrl_only_sigtab <- car.ctrl_only_sigtab[,1:6]
+
+cvp_mirs <- c("hsa-miR-591","hsa-miR-1226-3p","hsa-miR-513b-5p","hsa-miR-10a-5p","hsa-let-7f-5p","hsa-miR-5196-3p+hsa-miR-6732-3p","hsa-miR-183-5p","hsa-miR-551b-3p","hsa-miR-132-3p","hsa-miR-542-5p","hsa-miR-299-3p","hsa-miR-92b-3p","hsa-miR-517c-3p+hsa-miR-519a-3p","hsa-miR-1291","hsa-miR-874-3p","hsa-miR-362-3p","hsa-miR-889-3p","hsa-miR-142-5p","hsa-miR-338-5p","hsa-miR-518b","hsa-miR-1244","hsa-miR-449b-5p","hsa-miR-450a-2-3p","hsa-miR-1183","hsa-miR-608","hsa-miR-211-5p","hsa-miR-2053","hsa-miR-181c-5p","hsa-miR-95-3p","hsa-miR-492","hsa-miR-296-5p","hsa-miR-324-5p")
+
+mat1 <- t(ush_vs_cont_expr_counts)
+mat2 <- mat1[,colnames(mat1) %in% cvp_mirs]
+write.table(mat2, file = "patient_carrier_miRNA_differential_count_tab.tsv", sep = "\t")
+
+
+write.table(ush1.nbt.sigtab2, file = "ush1.nbt.sigtab.tsv", sep = "\t")
+write.table(ush2.nbt.sigtab2, file = "ush2.nbt.sigtab.tsv", sep = "\t")
+write.table(ush3.nbt.sigtab2, file = "ush3.nbt.sigtab.tsv", sep = "\t")
+
+write.table(ush1_only_sigtab, file = "ush1.only.sigtab.tsv", sep = "\t")
+write.table(ush2_only_sigtab, file = "ush2.only.sigtab.tsv", sep = "\t")
+write.table(ush3_only_sigtab, file = "ush3.only.sigtab.tsv", sep = "\t")
+
+write.table(shared_ush_differentials, file = "common_miRNAlist.tsv", sep = "\t")
+
+write.table(ush12_unique, file = "ush12_miRNAlist.tsv", sep = "\t")
+write.table(ush13_unique, file = "ush13_miRNAlist.tsv", sep = "\t")
+write.table(ush23_unique, file = "ush23_miRNAlist.tsv", sep = "\t")
+
+write.table(ush1_unique, file = "ush1_miRNAlist.tsv", sep = "\t")
+write.table(ush2_unique, file = "ush2_miRNAlist.tsv", sep = "\t")
+write.table(ush3_unique, file = "ush3_miRNAlist.tsv", sep = "\t")
+
+mat1 <- t(ush_vs_cont_expr_counts)
+mat3 <- mat1[,colnames(mat1) %in% full_derepped_list]
+write.table(mat3, file = "all_miRNA_differential_count_tab.tsv", sep = "\t")
+
+```
+
+
+```{r}
+
+#need to make a subset of the top candidates of differential miRNAs, make a master heatmap, then create a table with logfold changes and adjusted p-values etc.
+
+#the top 12 PCA and DESeq consistent
+
+top.miRNAS<- c("hsa-miR-146a-5p",
+"hsa-miR-155-5p",
+"hsa-miR-16-5p",
+"hsa-miR-29b-3p",
+"hsa-miR-19b-3p",
+"hsa-miR-4454+hsa-miR-7975",
+"hsa-miR-142-3p",
+"hsa-miR-96-5p",
+"hsa-miR-182-5p",
+"hsa-miR-183-5p",
+"hsa-miR-484",
+"hsa-miR-331-3p",
+"hsa-miR-296-5p",
+"hsa-miR-15a-5p",
+"hsa-miR-150-5p",
+"hsa-let-7a-5p",
+"hsa-miR-23a-3p",
+"hsa-miR-342-3p",
+"hsa-miR-4284",
+"hsa-miR-26b-5p",
+"hsa-miR-223-3p",
+"hsa-miR-21-5p")
+topmat <- mat[,colnames(mat) %in% top.miRNAS]
+View(topmat)
+ush_vs_cont_pheno_rename <- ush_vs_cont_pheno
+rownames(ush_vs_cont_pheno_rename) <- with(ush_vs_cont_pheno_rename, paste(sampleID,phenotype,genotype, sep = ":"))
+View(ush_vs_cont_pheno_rename)
+rownames(topmat) <- rownames(ush_vs_cont_pheno_rename)
+
+ 
+top_heatmap <- Heatmap(topmat, name = "Scale", 
+        cluster_rows = T, 
+        row_split = 3,
+        row_title = c("Control","Usher 2 & 3","Usher 1"),
+        row_dend_reorder = TRUE,
+        row_title_rot = 0,
+        column_km = 2,
+        column_title = LETTERS[1:2],
+        col= col_fun, 
+        column_names_rot = 45,
+        column_names_gp = gpar(fontsize=14))
+pdf(file = "top_htmap.pdf", width = 12, height = 8, fonts = "Times")
+top_heatmap
+dev.off()
+
+
+
+```
+
+```{r}
+
+#need to make a subset of the top candidates of differential miRNAs, make a master heatmap, then create a table with logfold changes and adjusted p-values etc.
+
+#the 12 miRNAs from ddPCR, and the top PCA miRNAs
+
+top.miRNAS<- c(
+"hsa-miR-155-5p",
+"hsa-miR-16-5p",
+"hsa-miR-19b-3p",
+"hsa-miR-4454+hsa-miR-7975",
+"hsa-miR-142-3p",
+"hsa-miR-96-5p",
+"hsa-miR-182-5p",
+"hsa-miR-183-5p",
+"hsa-miR-363-3p",
+"hsa-miR-150-5p",
+"hsa-let-7a-5p",
+"hsa-miR-28-5p",
+"hsa-miR-223-3p")
+topmat <- mat[,colnames(mat) %in% top.miRNAS]
+View(topmat)
+ush_vs_cont_pheno_rename <- ush_vs_cont_pheno
+rownames(ush_vs_cont_pheno_rename) <- with(ush_vs_cont_pheno_rename, paste(sampleID,phenotype,genotype, sep = ":"))
+View(ush_vs_cont_pheno_rename)
+rownames(topmat) <- rownames(ush_vs_cont_pheno_rename)
+v <- c("Usher-1D-(rep 1):CDH23","Usher-1D-(rep 2):CDH23","Usher-1D-(rep 3):CDH23","Usher-1B-(rep 1):MYO7A","Usher-1B-(rep 2):MYO7A","Control-(rep 1):Normal","Control-(rep 2):Normal","Control-(rep 3):Normal","Usher-3A-(rep 1):CLRN1","Usher-3A-(rep 2):CLRN1","Usher-3A-(rep 3):CLRN1","Usher-3A-(rep 4):CLRN1","Control-(rep 4):Normal","Usher-2A-(rep 1)::USH2A","Usher-2A-(rep 2)::USH2A","Usher-2A-(rep 3):USH2A","Usher-2A-(rep 4):USH2A")
+rownames(topmat) <- v
+
+testrnm <- topmat[c(6:8,13,4:5,1:3,14:17,9:12),] 
+top_heatmap <- Heatmap(testrnm, name = "Scale", 
+       cluster_rows = T, 
+       #row_split = 4,
+       #row_title = c("Control","Usher 1","Usher 2","Usher 3"),
+       row_dend_reorder = TRUE,
+       row_title_rot = 0,
+       column_km = 2,
+       column_title = LETTERS[1:2],
+       col= col_fun,
+       column_names_rot = 60,
+       column_names_gp = gpar(fontsize=14))
+       
+#pdf(file = "top_htmap.pdf", width = 12, height = 8, fonts = "Times")
+top_heatmap
+#dev.off()
+
+
+
+```
+
+```{r, eval=F}
+
+top_counts <- ush_vs_cont_expr_counts[row.names(ush_vs_cont_expr_counts) %in% top.miRNAS,]
+top_ush1 <- ush1.nbt.sigtab[row.names(ush1.nbt.sigtab) %in% top.miRNAS,1:6]
+top_ush2 <- ush2.nbt.sigtab[row.names(ush2.nbt.sigtab) %in% top.miRNAS,1:6]
+top_ush3 <-ush3.nbt.sigtab[row.names(ush3.nbt.sigtab) %in% top.miRNAS,1:6]
+
+
+write.table(top_counts, file = "top_counts.tsv", sep = "\t")
+write.table(top_ush1, file = "top_ush1.tsv", sep = "\t")
+write.table(top_ush2, file = "top_ush2.tsv", sep = "\t")
+write.table(top_ush3, file = "top_ush3.tsv", sep = "\t")
+
+
+```
+
+
+
+
+
+```{r}
+
+mut_tab <- read.delim("ush_variant_tab.txt")
+colnames(mut_tab) <- c("Cell Line","Phenotype","Chromosome Position","Ref/Alt","Genotype","Classification","ACMG Classification Criteria","HGVS cDot","Sequence Ontology","Gene Name","Gene Inheritance","Associated Conditions")
+
+tab2 <- kbl(mut_tab, format = "html", booktabs = T) %>%
+  kable_styling(full_width = F, latex_options = c("scale_down")) %>%
+  row_spec(0, bold = T) %>%
+  column_spec(12, width = "10em") %>%
+  column_spec(1, bold = T, underline = T)
+tab2
+
+```
+
+## ddPCR results
+Read in data
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+
+miRNA_ddpcr_down <- read.delim("ddpcr_down.txt", stringsAsFactors=TRUE)
+
+miRNA_ddpcr_up <- read.delim("ddpcr_up.txt", stringsAsFactors=TRUE)
+
+levels(miRNA_ddpcr_down$Sample) <- c("CONTROL","USH1B","USH1D","USH2A","USH3A")
+levels(miRNA_ddpcr_down$Sample)
+
+levels(miRNA_ddpcr_up$Sample) <- c("CONTROL","USH1B","USH1D","USH2A","USH3A")
+levels(miRNA_ddpcr_up$Sample)
+
+```
+
+#### ANOVAs with Tukey pairwise comparisons:
+363-3p
+```{r}
+library(dplyr)
+library(ggplot2)
+library(multcompView)
+library(ggthemes)
+library(ggsci)
+
+
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+
+# Compute the analysis of variance
+res.aov363 <- aov( miRNA_363_3p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_363 <- data_summary(miRNA_ddpcr_up,varname = "miRNA_363_3p", groupnames = "Sample")
+tukey363 <- TukeyHSD(res.aov363)
+summary(res.aov363)
+
+  
+group_lettering363 <- multcompLetters4(res.aov363,tukey363) #
+group_lettering363
+
+group_lettering363 <- data.frame(group_lettering363$Sample$Letters)
+group_lettering363$Sample <- rownames(group_lettering363)
+group_lettering363$Sample <- c("USH1D","USH2A","USH1B","USH3A","CONTROL")
+sum_aov_363 <- merge(sum_aov_363,group_lettering363, by = "Sample" )
+colnames(sum_aov_363)[4] <- "group_lettering"
+
+p363 <- ggplot(sum_aov_363, aes(x=reorder(Sample,+miRNA_363_3p), y=miRNA_363_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_363_3p-sd,0), ymax=miRNA_363_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_363_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-363-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-363-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+
+p363
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+150-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov150 <- aov( miRNA_150_5p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_150 <- data_summary(miRNA_ddpcr_up,varname = "miRNA_150_5p", groupnames = "Sample")
+tukey150 <- TukeyHSD(res.aov150)
+summary(res.aov150)
+
+  
+group_lettering150 <- multcompLetters4(res.aov150,tukey150) #
+group_lettering150
+
+group_lettering150 <- data.frame(group_lettering150$Sample$Letters)
+group_lettering150$Sample <- rownames(group_lettering150)
+sum_aov_150 <- merge(sum_aov_150,group_lettering150, by = "Sample" )
+colnames(sum_aov_150)[4] <- "group_lettering"
+
+p150 <- ggplot(sum_aov_150, aes(x=reorder(Sample,+miRNA_150_5p), y=miRNA_150_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_150_5p-sd,0), ymax=miRNA_150_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_150_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-150-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-150-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+p150
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+155-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov155 <- aov( miRNA_155_5p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_155 <- data_summary(miRNA_ddpcr_up,varname = "miRNA_155_5p", groupnames = "Sample")
+tukey155 <- TukeyHSD(res.aov155)
+summary(res.aov155)
+
+  
+group_lettering155 <- multcompLetters4(res.aov155,tukey155) #
+group_lettering155
+
+group_lettering155 <- data.frame(group_lettering155$Sample$Letters)
+group_lettering155$Sample <- rownames(group_lettering155)
+sum_aov_155 <- merge(sum_aov_155,group_lettering155, by = "Sample" )
+colnames(sum_aov_155)[4] <- "group_lettering"
+
+p155 <- ggplot(sum_aov_155, aes(x=reorder(Sample,+miRNA_155_5p), y=miRNA_155_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_155_5p-sd,0), ymax=miRNA_155_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_155_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-155-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-155-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+
+p155
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+223-3p
+```{r}
+
+# Compute the analysis of variance
+res.aov223 <- aov( miRNA_223_3p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_223 <- data_summary(miRNA_ddpcr_up,varname = "miRNA_223_3p", groupnames = "Sample")
+tukey223 <- TukeyHSD(res.aov223)
+summary(res.aov223)
+
+  
+group_lettering223 <- multcompLetters4(res.aov223,tukey223) #
+group_lettering223
+
+group_lettering223 <- data.frame(group_lettering223$Sample$Letters)
+group_lettering223$Sample <- rownames(group_lettering223)
+sum_aov_223 <- merge(sum_aov_223,group_lettering223, by = "Sample" )
+colnames(sum_aov_223)[4] <- "group_lettering"
+
+p223 <- ggplot(sum_aov_223, aes(x=reorder(Sample,+miRNA_223_3p), y=miRNA_223_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_223_3p-sd,0), ymax=miRNA_223_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_223_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-223-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-223-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p223
+
+#ggsave("USH_miR-155-3p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+7a-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov7a <- aov( let_7a_5p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_7a <- data_summary(miRNA_ddpcr_up,varname = "let_7a_5p", groupnames = "Sample")
+tukey7a <- TukeyHSD(res.aov7a)
+summary(res.aov7a)
+
+  
+group_lettering7a <- multcompLetters4(res.aov7a,tukey7a) #
+group_lettering7a
+
+group_lettering7a <- data.frame(group_lettering7a$Sample$Letters)
+group_lettering7a$Sample <- rownames(group_lettering7a)
+sum_aov_7a <- merge(sum_aov_7a,group_lettering7a, by = "Sample" )
+colnames(sum_aov_7a)[4] <- "group_lettering"
+
+p7a <- ggplot(sum_aov_7a, aes(x=reorder(Sample,+let_7a_5p), y=let_7a_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(let_7a_5p-sd,0), ymax=let_7a_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = let_7a_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "let-7a-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("let-7a-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+p7a
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+142-3p
+```{r}
+
+# Compute the analysis of variance
+res.aov142 <- aov( miRNA_142_3p ~ Sample, data = miRNA_ddpcr_up)
+# Summary of the analysis
+sum_aov_142 <- data_summary(miRNA_ddpcr_up,varname = "miRNA_142_3p", groupnames = "Sample")
+tukey142 <- TukeyHSD(res.aov142)
+summary(res.aov142)
+
+  
+group_lettering142 <- multcompLetters4(res.aov142,tukey142) #
+group_lettering142
+
+group_lettering142 <- data.frame(group_lettering142$Sample$Letters)
+group_lettering142$Sample <- rownames(group_lettering142)
+sum_aov_142 <- merge(sum_aov_142,group_lettering142, by = "Sample" )
+colnames(sum_aov_142)[4] <- "group_lettering"
+
+p142 <- ggplot(sum_aov_142, aes(x=reorder(Sample,+miRNA_142_3p), y=miRNA_142_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_142_3p-sd,0), ymax=miRNA_142_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_142_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-142-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-142-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p142
+
+#ggsave("USH_miR-155-3p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+
+```{r}
+library(ggpubr)
+total_anovas <- ggarrange(p363,p223,p150,p155,p7a,p142,
+          nrow = 2,
+          ncol = 3,
+          legend = "none",
+          labels = "AUTO")
+total_anovas
+
+#ggsave(total_anovas, filename = "ddpcr_up.pdf", device = "pdf", width = 8, height = 8)
+```
+
+
+#### Downregulated ddPCR miRNAs
+
+96-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov96 <- aov( miRNA_96_5p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_96 <- data_summary(miRNA_ddpcr_down,varname = "miRNA_96_5p", groupnames = "Sample")
+tukey96 <- TukeyHSD(res.aov96)
+summary(res.aov96)
+
+  
+group_lettering96 <- multcompLetters4(res.aov96,tukey96) #
+group_lettering96
+
+group_lettering96 <- data.frame(group_lettering96$Sample$Letters)
+group_lettering96$Sample <- rownames(group_lettering96)
+sum_aov_96 <- merge(sum_aov_96,group_lettering96, by = "Sample" )
+colnames(sum_aov_96)[4] <- "group_lettering"
+
+p96 <- ggplot(sum_aov_96, aes(x=reorder(Sample,-miRNA_96_5p), y=miRNA_96_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_96_5p-sd,0), ymax=miRNA_96_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_96_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-96-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-96-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p96
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+182-3p
+```{r}
+
+# Compute the analysis of variance
+res.aov182 <- aov( miRNA_182_3p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_182 <- data_summary(miRNA_ddpcr_down,varname = "miRNA_182_3p", groupnames = "Sample")
+tukey182 <- TukeyHSD(res.aov182)
+summary(res.aov182)
+
+  
+group_lettering182 <- multcompLetters4(res.aov182,tukey182) #
+group_lettering182
+
+group_lettering182 <- data.frame(group_lettering182$Sample$Letters)
+group_lettering182$Sample <- rownames(group_lettering182)
+sum_aov_182 <- merge(sum_aov_182,group_lettering182, by = "Sample" )
+colnames(sum_aov_182)[4] <- "group_lettering"
+
+p182 <- ggplot(sum_aov_182, aes(x=reorder(Sample,-miRNA_182_3p), y=miRNA_182_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_182_3p-sd,0), ymax=miRNA_182_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_182_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-182-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-182-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p182
+
+#ggsave("USH_miR-155-3p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+183-3p
+```{r}
+
+# Compute the analysis of variance
+res.aov183 <- aov( miRNA_183_3p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_183 <- data_summary(miRNA_ddpcr_down,varname = "miRNA_183_3p", groupnames = "Sample")
+tukey183 <- TukeyHSD(res.aov183)
+summary(res.aov183)
+
+  
+group_lettering183 <- multcompLetters4(res.aov183,tukey183) #
+group_lettering183
+
+group_lettering183 <- data.frame(group_lettering183$Sample$Letters)
+group_lettering183$Sample <- rownames(group_lettering183)
+sum_aov_183 <- merge(sum_aov_183,group_lettering183, by = "Sample" )
+colnames(sum_aov_183)[4] <- "group_lettering"
+
+p183 <- ggplot(sum_aov_183, aes(x=reorder(Sample,-miRNA_183_3p), y=miRNA_183_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_183_3p-sd,0), ymax=miRNA_183_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_183_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-183-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-183-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p183
+
+#ggsave("USH_miR-155-3p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+
+28-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov28 <- aov( miRNA_28_5p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_28 <- data_summary(miRNA_ddpcr_down,varname = "miRNA_28_5p", groupnames = "Sample")
+tukey28 <- TukeyHSD(res.aov28)
+summary(res.aov28)
+
+  
+group_lettering28 <- multcompLetters4(res.aov28,tukey28) #
+group_lettering28
+
+group_lettering28 <- data.frame(group_lettering28$Sample$Letters)
+group_lettering28$Sample <- rownames(group_lettering28)
+sum_aov_28 <- merge(sum_aov_28,group_lettering28, by = "Sample" )
+colnames(sum_aov_28)[4] <- "group_lettering"
+
+p28 <- ggplot(sum_aov_28, aes(x=reorder(Sample, -miRNA_28_5p), y=miRNA_28_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_28_5p-sd,0), ymax=miRNA_28_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_28_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-28-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-28-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p28
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+16-5p
+```{r}
+
+# Compute the analysis of variance
+res.aov16 <- aov( miRNA_16_5p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_16 <- data_summary(miRNA_ddpcr_down,varname = "miRNA_16_5p", groupnames = "Sample")
+tukey16 <- TukeyHSD(res.aov16)
+summary(res.aov16)
+
+  
+group_lettering16 <- multcompLetters4(res.aov16,tukey16) #
+group_lettering16
+
+group_lettering16 <- data.frame(group_lettering16$Sample$Letters)
+group_lettering16$Sample <- rownames(group_lettering16)
+sum_aov_16 <- merge(sum_aov_16,group_lettering16, by = "Sample" )
+colnames(sum_aov_16)[4] <- "group_lettering"
+
+p16 <- ggplot(sum_aov_16, aes(x=reorder(Sample, -miRNA_16_5p), y=miRNA_16_5p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_16_5p-sd,0), ymax=miRNA_16_5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_16_5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-16-5p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-16-5p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p16
+
+#ggsave("USH_miR-155-5p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+19b-3p
+```{r}
+
+# Compute the analysis of variance
+res.aov19b <- aov( miRNA_19b_3p ~ Sample, data = miRNA_ddpcr_down)
+# Summary of the analysis
+sum_aov_19b <- data_summary(miRNA_ddpcr_down,varname = "miRNA_19b_3p", groupnames = "Sample")
+tukey19b <- TukeyHSD(res.aov19b)
+summary(res.aov19b)
+
+  
+group_lettering19b <- multcompLetters4(res.aov19b,tukey19b) #
+group_lettering19b
+
+group_lettering19b <- data.frame(group_lettering19b$Sample$Letters)
+group_lettering19b$Sample <- rownames(group_lettering19b)
+sum_aov_19b <- merge(sum_aov_19b,group_lettering19b, by = "Sample" )
+colnames(sum_aov_19b)[4] <- "group_lettering"
+
+p19b <- ggplot(sum_aov_19b, aes(x=reorder(Sample,-miRNA_19b_3p), y=miRNA_19b_3p, fill=Sample)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(miRNA_19b_3p-sd,0), ymax=miRNA_19b_3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = miRNA_19b_3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-19b-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-19b-3p copies/ng RNA")+
+  scale_x_discrete(guide = guide_axis(angle = 45))
+  
+
+p19b
+
+#ggsave("USH_miR-155-3p_anova.pdf", plot = p1, device = 'pdf', width = 7, height = 7)
+
+
+
+```
+
+
+combined
+```{r}
+down_anovas <- ggarrange(p28,p96,p182,p183,p16,p19b,
+          nrow = 2,
+          ncol = 3,
+          legend = "none",
+          labels = "AUTO")
+down_anovas
+
+#ggsave(down_anovas, filename = "ddpcr_down.pdf", device = "pdf", width = 8, height = 8)
+
+```
+
+```{r}
+
+library(ampvis2)
+#uvc.amp <- phyloseq_to_ampvis2(uvc.ps) ##outdated
+uvc.amp <- amp_load(uvc.ps)
+prop_mirna_abs <- amp_heatmap(data = uvc.amp, tax_aggregate = "Species", group_by = "genotype", tax_show = 20)
+
+
+bar_plot <- uvc.ps %>%
+  tax_fix(min_length = 0,
+          unknowns = NA,
+          anon_unique = T) %>%
+  comp_barplot(
+    tax_level = "Species", n_taxa = 20, other_name = "Other",
+    taxon_renamer = function(x) stringr::str_remove(x, " [ae]t rel."),
+    palette = distinct_palette(n = 20, add = "grey90"),
+    merge_other = FALSE, bar_outline_colour = "darkgrey"
+  )
+bar_plot
+#ggsave(prop_mirna_abs, filename = "mirna_props.pdf", device = "pdf", width = 10, height = 10)
+
+#ggsave(bar_plot, filename = "mirna_bars.pdf", device = "pdf", width = 10, height = 10)
+```
+
+
+```{r}
+fc_tab <- read.delim("fc_tab.txt")
+
+colnames(fc_tab) <- c("microRNA","log2FC","P-Value (BH-adj.)","log2FC","P-Value (BH-adj.)","log2FC", "P-Value (BH-adj.)","Average log2FC","Standard Dev.")
+#library(kableExtra)
+
+fctab<- kbl(fc_tab, format = "html", booktabs = T) %>%
+  kable_styling(full_width = F, latex_options = c("scale_down")) %>%
+  add_header_above(c(" ", "Usher 1" = 2, "Usher 2" = 2, "Usher 3" = 2,"Mean Log2FC vs. Control"=2), bold = T) %>%
+  row_spec(0, bold = T) %>%
+  #column_spec(3, width = "30em") #%>%
+  column_spec(1, bold = T) #%>%
+  #column_spec(2, bold = T)
+fctab
+#save_kable(fctab, file = "mirna_fc.pdf")
+
+ddpcr_fc_tab <- read.delim("ddPCR_log2FC_tab.txt", row.names = 1)
+colnames(ddpcr_fc_tab) <- c("log2FC","P-value (Tukey)", "log2FC","P-value (Tukey)", "log2FC","P-value (Tukey)", "log2FC","P-value (Tukey)", "Average log2FC" ,"Standard Dev.")
+
+
+ddpcr_fc_tab <- kbl(ddpcr_fc_tab, format = "html", booktabs = T) %>%
+  kable_styling(full_width = F, latex_options = c("scale_down")) %>%
+  add_header_above(c(" ", "USH1B" = 2,"USH1D"=2,"USH2A"=2,"USH3A"=2, "Summary" = 2), bold = T) %>%
+  row_spec(0, bold = T) %>%
+  #column_spec(4, width = "30em") %>%
+  column_spec(1, bold = T) #%>%
+  #column_spec(2, bold = T)
+ddpcr_fc_tab
+#save_kable(ddpcr_fc_tab, file = "~/Desktop/ddpcr_fc_tab.pdf")
+```
+
+
+# Microarray ANOVAS with tukey adjustments for multiple comparisons
+
+make a data tabel of the 12 miRNAs of interest
+```{r}
+microarray_counts <- ush_vs_cont_expr_counts[rownames(ush_vs_cont_expr_counts) %in% c("hsa-miR-155-5p","hsa-miR-150-5p","hsa-miR-363-3p","hsa-miR-223-3p","hsa-miR-28-5p","hsa-miR-182-5p","hsa-miR-183-5p","hsa-miR-96-5p","hsa-let-7a-5p","hsa-miR-142-3p","hsa-miR-16-5p","hsa-miR-19b-3p"), ]
+microarray_counts <- data.frame(t(microarray_counts))
+microarray_counts$sampleID <- rownames(microarray_counts)
+
+
+newdf <- merge(microarray_counts, ush_vs_cont_pheno_rename, by = "sampleID")
+newdf$genotype <- as.factor(newdf$genotype)
+levels(newdf$genotype) <- c("USH1D","USH3A","USH1B","CONTROL","USH2A")
+levels(newdf$genotype)
+```
+
+
+28-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov28.ma <- aov( hsa.miR.28.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_28.ma <- data_summary(newdf,varname = "hsa.miR.28.5p", groupnames = "genotype")
+tukey28.ma <- TukeyHSD(res.aov28.ma)
+summary(res.aov28.ma)
+
+  
+group_lettering28.ma <- multcompLetters4(res.aov28.ma,tukey28.ma) #
+group_lettering28.ma
+
+group_lettering28.ma <- data.frame(group_lettering28.ma$genotype$Letters)
+group_lettering28.ma$genotype <- rownames(group_lettering28.ma)
+sum_aov_28.ma <- merge(sum_aov_28.ma,group_lettering28.ma, by = "genotype" )
+colnames(sum_aov_28.ma)[4] <- "group_lettering"
+
+p28.ma <- ggplot(sum_aov_28.ma, aes(x=reorder(genotype,-hsa.miR.28.5p), y=hsa.miR.28.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.28.5p-sd,0), ymax=hsa.miR.28.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.28.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-28-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-28-5p Count")
+  
+
+p28.ma
+
+
+
+
+```
+
+19b-3p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov19b.ma <- aov( hsa.miR.19b.3p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_19b.ma <- data_summary(newdf,varname = "hsa.miR.19b.3p", groupnames = "genotype")
+tukey19b.ma <- TukeyHSD(res.aov19b.ma)
+summary(res.aov19b.ma)
+
+  
+group_lettering19b.ma <- multcompLetters4(res.aov19b.ma,tukey19b.ma) #
+group_lettering19b.ma
+
+group_lettering19b.ma <- data.frame(group_lettering19b.ma$genotype$Letters)
+group_lettering19b.ma$genotype <- rownames(group_lettering19b.ma)
+sum_aov_19b.ma <- merge(sum_aov_19b.ma,group_lettering19b.ma, by = "genotype" )
+colnames(sum_aov_19b.ma)[4] <- "group_lettering"
+
+p19b.ma <- ggplot(sum_aov_19b.ma, aes(x=reorder(genotype,-hsa.miR.19b.3p), y=hsa.miR.19b.3p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.19b.3p-sd,0), ymax=hsa.miR.19b.3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.19b.3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-19b-3p ") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-19b-3p Count")
+  
+
+p19b.ma
+
+
+```
+
+
+16-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov16.ma <- aov( hsa.miR.16.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_16.ma <- data_summary(newdf,varname = "hsa.miR.16.5p", groupnames = "genotype")
+tukey16.ma <- TukeyHSD(res.aov16.ma)
+summary(res.aov16.ma)
+
+  
+group_lettering16.ma <- multcompLetters4(res.aov16.ma,tukey16.ma) #
+group_lettering16.ma
+
+group_lettering16.ma <- data.frame(group_lettering16.ma$genotype$Letters)
+group_lettering16.ma$genotype <- rownames(group_lettering16.ma)
+sum_aov_16.ma <- merge(sum_aov_16.ma,group_lettering16.ma, by = "genotype" )
+colnames(sum_aov_16.ma)[4] <- "group_lettering"
+
+p16.ma <- ggplot(sum_aov_16.ma, aes(x=reorder(genotype, -hsa.miR.16.5p), y=hsa.miR.16.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.16.5p-sd,0), ymax=hsa.miR.16.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.16.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-16-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-16-5p Count")
+  
+
+p16.ma
+
+
+```
+
+96-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov96.ma <- aov( hsa.miR.96.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_96.ma <- data_summary(newdf,varname = "hsa.miR.96.5p", groupnames = "genotype")
+tukey96.ma <- TukeyHSD(res.aov96.ma)
+summary(res.aov96.ma)
+
+  
+group_lettering96.ma <- multcompLetters4(res.aov96.ma,tukey96.ma) #
+group_lettering96.ma
+
+group_lettering96.ma <- data.frame(group_lettering96.ma$genotype$Letters)
+group_lettering96.ma$genotype <- rownames(group_lettering96.ma)
+sum_aov_96.ma <- merge(sum_aov_96.ma,group_lettering96.ma, by = "genotype" )
+colnames(sum_aov_96.ma)[4] <- "group_lettering"
+
+p96.ma <- ggplot(sum_aov_96.ma, aes(x=reorder(genotype, -hsa.miR.96.5p), y=hsa.miR.96.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.96.5p-sd,0), ymax=hsa.miR.96.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.96.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-96-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-96-5p Count")
+  
+
+p96.ma
+
+
+```
+
+182-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov182.ma <- aov( hsa.miR.182.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_182.ma <- data_summary(newdf,varname = "hsa.miR.182.5p", groupnames = "genotype")
+tukey182.ma <- TukeyHSD(res.aov182.ma)
+summary(res.aov182.ma)
+
+  
+group_lettering182.ma <- multcompLetters4(res.aov182.ma,tukey182.ma) #
+group_lettering182.ma
+
+group_lettering182.ma <- data.frame(group_lettering182.ma$genotype$Letters)
+group_lettering182.ma$genotype <- rownames(group_lettering182.ma)
+sum_aov_182.ma <- merge(sum_aov_182.ma,group_lettering182.ma, by = "genotype" )
+colnames(sum_aov_182.ma)[4] <- "group_lettering"
+
+p182.ma <- ggplot(sum_aov_182.ma, aes(x=reorder(genotype, -hsa.miR.182.5p), y=hsa.miR.182.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.182.5p-sd,0), ymax=hsa.miR.182.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.182.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-182-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-182-5p Count")
+  
+
+p182.ma
+
+
+```
+
+183-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov183.ma <- aov( hsa.miR.183.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_183.ma <- data_summary(newdf,varname = "hsa.miR.183.5p", groupnames = "genotype")
+tukey183.ma <- TukeyHSD(res.aov183.ma)
+summary(res.aov183.ma)
+
+  
+group_lettering183.ma <- multcompLetters4(res.aov183.ma,tukey183.ma) #
+group_lettering183.ma
+
+group_lettering183.ma <- data.frame(group_lettering183.ma$genotype$Letters)
+group_lettering183.ma$genotype <- rownames(group_lettering183.ma)
+sum_aov_183.ma <- merge(sum_aov_183.ma,group_lettering183.ma, by = "genotype" )
+colnames(sum_aov_183.ma)[4] <- "group_lettering"
+
+p183.ma <- ggplot(sum_aov_183.ma, aes(x=reorder(genotype,-hsa.miR.183.5p), y=hsa.miR.183.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.183.5p-sd,0), ymax=hsa.miR.183.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.183.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-183-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-183-5p Count")
+  
+
+p183.ma
+
+
+```
+
+
+150-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov150.ma <- aov( hsa.miR.150.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_150.ma <- data_summary(newdf,varname = "hsa.miR.150.5p", groupnames = "genotype")
+tukey150.ma <- TukeyHSD(res.aov150.ma)
+summary(res.aov150.ma)
+
+  
+group_lettering150.ma <- multcompLetters4(res.aov150.ma,tukey150.ma) #
+group_lettering150.ma
+
+group_lettering150.ma <- data.frame(group_lettering150.ma$genotype$Letters)
+group_lettering150.ma$genotype <- rownames(group_lettering150.ma)
+sum_aov_150.ma <- merge(sum_aov_150.ma,group_lettering150.ma, by = "genotype" )
+colnames(sum_aov_150.ma)[4] <- "group_lettering"
+
+p150.ma <- ggplot(sum_aov_150.ma, aes(x=reorder(genotype, +hsa.miR.150.5p), y=hsa.miR.150.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.150.5p-sd,0), ymax=hsa.miR.150.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.150.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-150-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-150-5p Count")
+  
+
+p150.ma
+
+
+```
+
+
+155-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov155.ma <- aov( hsa.miR.155.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_155.ma <- data_summary(newdf,varname = "hsa.miR.155.5p", groupnames = "genotype")
+tukey155.ma <- TukeyHSD(res.aov155.ma)
+summary(res.aov155.ma)
+
+  
+group_lettering155.ma <- multcompLetters4(res.aov155.ma,tukey155.ma) #
+group_lettering155.ma
+
+group_lettering155.ma <- data.frame(group_lettering155.ma$genotype$Letters)
+group_lettering155.ma$genotype <- rownames(group_lettering155.ma)
+sum_aov_155.ma <- merge(sum_aov_155.ma,group_lettering155.ma, by = "genotype" )
+colnames(sum_aov_155.ma)[4] <- "group_lettering"
+
+p155.ma <- ggplot(sum_aov_155.ma, aes(x=reorder(genotype,+hsa.miR.155.5p), y=hsa.miR.155.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.155.5p-sd,0), ymax=hsa.miR.155.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.155.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-155-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-155-5p Count")
+  
+
+p155.ma
+
+
+```
+
+
+7a-5p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov7a.ma <- aov( hsa.let.7a.5p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_7a.ma <- data_summary(newdf,varname = "hsa.let.7a.5p", groupnames = "genotype")
+tukey7a.ma <- TukeyHSD(res.aov7a.ma)
+summary(res.aov7a.ma)
+
+  
+group_lettering7a.ma <- multcompLetters4(res.aov7a.ma,tukey7a.ma) #
+group_lettering7a.ma
+
+group_lettering7a.ma <- data.frame(group_lettering7a.ma$genotype$Letters)
+group_lettering7a.ma$genotype <- rownames(group_lettering7a.ma)
+sum_aov_7a.ma <- merge(sum_aov_7a.ma,group_lettering7a.ma, by = "genotype" )
+colnames(sum_aov_7a.ma)[4] <- "group_lettering"
+
+p7a.ma <- ggplot(sum_aov_7a.ma, aes(x=reorder(genotype, +hsa.let.7a.5p), y=hsa.let.7a.5p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.let.7a.5p-sd,0), ymax=hsa.let.7a.5p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.let.7a.5p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "let-7a-5p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("let-7a-5p Count")
+  
+
+p7a.ma
+
+
+```
+
+
+363-3p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov363.ma <- aov( hsa.miR.363.3p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_363.ma <- data_summary(newdf,varname = "hsa.miR.363.3p", groupnames = "genotype")
+tukey363.ma <- TukeyHSD(res.aov363.ma)
+summary(res.aov363.ma)
+
+  
+group_lettering363.ma <- multcompLetters4(res.aov363.ma,tukey363.ma) #
+group_lettering363.ma
+
+group_lettering363.ma <- data.frame(group_lettering363.ma$genotype$Letters)
+group_lettering363.ma$genotype <- rownames(group_lettering363.ma)
+sum_aov_363.ma <- merge(sum_aov_363.ma,group_lettering363.ma, by = "genotype" )
+colnames(sum_aov_363.ma)[4] <- "group_lettering"
+
+p363.ma <- ggplot(sum_aov_363.ma, aes(x=reorder(genotype,+hsa.miR.363.3p), y=hsa.miR.363.3p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.363.3p-sd,0), ymax=hsa.miR.363.3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.363.3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-363-3p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-363-3p Count")
+  
+
+p363.ma
+
+
+```
+
+223-3p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov223.ma <- aov( hsa.miR.223.3p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_223.ma <- data_summary(newdf,varname = "hsa.miR.223.3p", groupnames = "genotype")
+tukey223.ma <- TukeyHSD(res.aov223.ma)
+summary(res.aov223.ma)
+
+  
+group_lettering223.ma <- multcompLetters4(res.aov223.ma,tukey223.ma) #
+group_lettering223.ma
+
+group_lettering223.ma <- data.frame(group_lettering223.ma$genotype$Letters)
+group_lettering223.ma$genotype <- rownames(group_lettering223.ma)
+sum_aov_223.ma <- merge(sum_aov_223.ma,group_lettering223.ma, by = "genotype" )
+colnames(sum_aov_223.ma)[4] <- "group_lettering"
+
+p223.ma <- ggplot(sum_aov_223.ma, aes(x=reorder(genotype,+hsa.miR.223.3p), y=hsa.miR.223.3p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.223.3p-sd,0), ymax=hsa.miR.223.3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.223.3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-223-3p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-223-3p Count")
+  
+
+p223.ma
+
+
+```
+
+
+142-3p Microarray
+```{r}
+
+# Compute the analysis of variance
+res.aov142.ma <- aov( hsa.miR.142.3p ~ genotype, data = newdf)
+# Summary of the analysis
+sum_aov_142.ma <- data_summary(newdf,varname = "hsa.miR.142.3p", groupnames = "genotype")
+tukey142.ma <- TukeyHSD(res.aov142.ma)
+summary(res.aov142.ma)
+
+  
+group_lettering142.ma <- multcompLetters4(res.aov142.ma,tukey142.ma) #
+group_lettering142.ma
+
+group_lettering142.ma <- data.frame(group_lettering142.ma$genotype$Letters)
+group_lettering142.ma$genotype <- rownames(group_lettering142.ma)
+sum_aov_142.ma <- merge(sum_aov_142.ma,group_lettering142.ma, by = "genotype" )
+colnames(sum_aov_142.ma)[4] <- "group_lettering"
+
+p142.ma <- ggplot(sum_aov_142.ma, aes(x=reorder(genotype, +hsa.miR.142.3p), y=hsa.miR.142.3p, fill=genotype)) + 
+  geom_bar(stat="identity", color="black", 
+           position=position_dodge(),width = 0.5) +
+  geom_errorbar(aes(ymin=pmax(hsa.miR.142.3p-sd,0), ymax=hsa.miR.142.3p+sd), width=.2,
+                 position=position_dodge(.9)) +
+  scale_fill_manual("Genotype",values = c("CONTROL"="#374E55FF","USH1B"="#DF8F44FF","USH1D"="#00A1D5FF", "USH2A"="#B24745FF","USH3A"="#79AF97FF"))+
+  geom_text(aes(label = group_lettering, y = hsa.miR.142.3p + sd), vjust=-0.4, position=position_dodge(0.9))+
+  labs(title = "miRNA-142-3p") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position="none",
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        axis.line = element_line(colour = "black")) +
+  xlab("") +
+  ylab("miRNA-142-3p Count")
+  
+
+p142.ma
+
+
+```
+
+
+microarray anova combined
+```{r}
+down_anovas.ma <- ggarrange(p28.ma,p96.ma,p182.ma,p183.ma,p16.ma,p19b.ma,
+          nrow = 2,
+          ncol = 3,
+          labels = "AUTO",
+          legend = "none")
+down_anovas.ma
+
+#ggsave(down_anovas.ma, filename = "microarray_down.pdf", device = "pdf", width = 10, height = 10)
+
+
+
+up_anovas.ma <- ggarrange(p363.ma,p223.ma,p150.ma,p155.ma,p7a.ma,p142.ma,
+          nrow = 2,
+          ncol = 3,
+          labels = "AUTO",
+          legend = "none")
+up_anovas.ma
+
+#ggsave(up_anovas.ma, filename = "microarray_up.pdf", device = "pdf", width = 10, height = 10)
+```

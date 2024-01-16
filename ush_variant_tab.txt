@@ -1,0 +1,6 @@
+Cell Line	Phenotype	Chr:Pos	Ref/Alt	Genotype	Classification	ACMG Classification Criteria	HGVS cDot	Sequence Ontology	Gene Name	Gene Inheritance	Conditions
+D3739	Usher-1D	10:71779316	G/A	Homozygous	Likely Pathogenic	"PM2, PS1, PP3"	NM_022124.6:c.5237G>A	missense	CDH23	Recessive	"Usher syndrome type 1D, CDH23-Related Disorders, Autosomal recessive nonsyndromic hearing loss 12;Pituitary adenoma 5, Rare genetic deafness, Retinal dystrophy, Childhood onset hearing loss, Usher syndrome"
+D3741	Usher-1B	11:77181589	G/T	Homozygous	Likely Pathogenic	"PM2, PP2, PS1, PP3"	NM_000260.4:c.2904G>T	missense	MYO7A	Recessive	"Rare genetic deafness, Autosomal recessive nonsyndromic hearing loss 2, Usher syndrome type 1B"
+D2880	Usher-3A	3:150928107	A/C	Homozygous	VUS/Conflicting	"BS1, PVS1 Strong, PP5"	NM_174878.3:c.528T>G	stop gained	CLRN1	Recessive	"Usher syndrome type 3, Rare genetic deafness, Retinitis pigmentosa 61;Usher syndrome type 3A"
+Coriell(GM09053)	Usher-2A	1:216190280	AG/-	Heterozygous	Pathogenic	"PM2, PVS1, PP5"	NM_206933.4:c.4338_4339delCT	frameshift	USH2A	Recessive	"Usher syndrome type 2A, USH2A-Related Disorders, Retinal dystrophy, Retinitis pigmentosa 39;Usher syndrome type 2A"
+		1:215647526	T/-	Heterozygous	Pathogenic	"PM2, PVS1, PP5"	NM_206933.4:c.14787delA	frameshift	USH2A	Recessive	Retinal dystrophy
